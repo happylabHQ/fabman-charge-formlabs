@@ -38,12 +38,12 @@ This PHP script enables **automated billing** for **Formlabs 3D printers** throu
 2. **Configure constants** at the top of the script:
 
 ```php
-const WEBHOOK_TOKEN     = 'your_webhook_token';
-const FABMAN_API_URL    = 'https://internal.fabman.io/api/v1/';
-const FABMAN_TOKEN      = 'your_fabman_api_token';
+const WEBHOOK_TOKEN      = 'your_webhook_token';
+const FABMAN_API_URL     = 'https://fabman.io/api/v1/';
+const FABMAN_TOKEN       = 'your_fabman_api_token';
 const FORMLABS_CLIENT_ID = 'your_formlabs_client_id';
-const FORMLABS_USER     = 'your_user_email@example.com';
-const FORMLABS_PASSWORD = 'your_formlabs_password';
+const FORMLABS_USER      = 'your_user_email@example.com';
+const FORMLABS_PASSWORD  = 'your_formlabs_password';
 ```
 
 3. **Define webhook** in Fabman:
@@ -51,7 +51,7 @@ const FORMLABS_PASSWORD = 'your_formlabs_password';
    * Event: `resourceLog_created` or `resourceLog_updated`
    * URL: `https://yourdomain.com/chargeFormlabs.php?secret=your_webhook_token&resources=1322,1516`
 
-> ⚠️ You must explicitly list the resource IDs to handle via the `resources` URL parameter.
+> ⚠️ You must explicitly list the Fabman resource IDs of the Formlabs 3D printers (comma-separated list) to handle via the `resources` URL parameter and `secret` must match WEBHOOK_TOKEN in the script.
 
 ---
 
