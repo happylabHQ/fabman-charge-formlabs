@@ -63,6 +63,26 @@ const FORMLABS_PASSWORD  = 'your_formlabs_password';
 
 ---
 
+## 🔌 Fabman Configuration
+
+To ensure charges are triggered **after a print finishes**, we recommend the following settings in your printer's resource configuration in Fabman:
+
+1. ✅ **Enable machine status detection via power consumption**  
+   → Activate “Detect machine status based on power consumption”  
+   → Set threshold to **40 VA**
+
+2. ✅ **Enable automatic shutdown of idle equipment**  
+   → Activate “Turn off idle equipment if members don’t interact”  
+   → Set timeout to a suitable value (e.g., **10 minutes**)
+
+These settings ensure the printer powers down a few minutes after the print finishes.  
+The power-off event will trigger a `resourceLog_updated` webhook — causing the charge to be created.
+
+> ⚠️ Only the **latest print job** from the printer is used for billing.  
+> Therefore, it's essential that the Fabman bridge is powered off **after each print job** — either **automatically** via idle timeout or **manually** by the user.
+
+---
+
 ## 💼 Resource Metadata Example
 
 In Fabman, under each resource, add metadata like:
