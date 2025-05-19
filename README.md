@@ -90,7 +90,7 @@ In Fabman, under each resource, add metadata like:
 ```json
 {
   "printer_serial": "LucidEel",
-  "price_per_ml": 1,
+  "price_per_ml": 0.10,
   "FLCW4001": {
     "name": "CastableWax40",
     "price_per_ml": 0.23
