@@ -25,10 +25,18 @@ This PHP script enables **automated billing** for **Formlabs 3D printers** throu
 
 ## ✅ Requirements
 
-* PHP 7.4+ with cURL
-* Access to a publicly accessible server (for webhooks)
-* Fabman account with API access
-* Formlabs printer + API credentials
+- **Fabman API Access**  
+  You need an active [Fabman](https://fabman.io/) account with API access enabled.
+
+- **Formlabs Web API Access**  
+  Enable API access in your Formlabs dashboard and create a developer client (Client ID & Secret).
+
+- **PHP-Compatible Web Server**  
+  This webhook is written in PHP. It requires a server that supports PHP 7.4 or newer.
+
+- **Valid SSL Certificate**  
+  Your server must be accessible via **HTTPS** and have a **valid SSL certificate**.  
+  This is a requirement for Fabman to successfully deliver webhook requests.
 
 ---
 
