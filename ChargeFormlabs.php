@@ -123,7 +123,7 @@ $date_time = date("Y-m-d\TH:i:s", strtotime($date_time));
 $description = sprintf(
     'Formlabs print "%s" on %s',
     $print_job->name,
-    $resource_metadata->name ?? 'unknown device'
+    $payload->details->resource->name ?? 'unknown device'
 );
 
 debug("Creating charge for member ID $member_id on $date_time: $description");
