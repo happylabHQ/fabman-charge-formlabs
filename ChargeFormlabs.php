@@ -129,7 +129,7 @@ $description = sprintf(
 debug("Creating charge for member ID $member_id on $date_time: $description");
 
 $result = create_charge($member_id, $date_time, $description, $price, (int)$log->id);
-if ($result['http_code'] !== 200 && $result['http_code'] !== 201) {
+if ($result['http_code'] !== 200 && $result['http_code'] !== 201 && $result['http_code'] !== 204) {
     http_response_code(500);
     exit("Failed to create charge: HTTP {$result['http_code']}");
 }
