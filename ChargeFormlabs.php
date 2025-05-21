@@ -78,6 +78,12 @@ if (!isset($log->stopType)) {
     exit('Event is not a stop; nothing to do.');
 }
 
+if (isset($log->metadata->{'Formlabs Printjob'})) {
+    debug("Metadata already contains 'Formlabs Printjob'. Skipping billing.");
+    http_response_code(202);
+    exit("Job already processed – skipping.");
+}
+
 $resource_metadata = get_resource_metadata($resource_id);
 debug("Loaded resource metadata: " . json_encode($resource_metadata));
 
@@ -100,8 +106,9 @@ if ($print_job === null) {
     exit("Failed to fetch print job for printer serial {$resource_metadata->printer_serial}");
 }
 
-$material_code = $print_job->material ?? null;
+$material_code = $print_job->material ?? 'n/a';
 $volume_ml = $print_job->volume_ml ?? 0;
+
 debug("Material: $material_code, Volume: $volume_ml ml");
 
 if ($material_code && isset($resource_metadata->{$material_code}->price_per_ml)) {
@@ -132,6 +139,26 @@ $result = create_charge($member_id, $date_time, $description, $price, (int)$log-
 if (!in_array($result['http_code'], [200, 201, 204])) {
     http_response_code(500);
     exit("Failed to create charge: HTTP {$result['http_code']}");
+}
+
+$job_metadata = [
+    "Formlabs Printjob" => [
+        "Print Name"   => $print_job->name ?? null,
+        "Material"     => $material_code,
+        "Volume (ml)"  => $volume_ml,
+        "Price (EUR)"  => $price,
+        "Started At"   => $print_job->print_started_at ?? null,
+        "Finished At"  => $print_job->print_finished_at ?? null,
+        "Job ID"       => $print_job->id ?? null,
+    ]
+];
+
+debug("Setting metadata for resourceLog ID {$log->id}");
+$metadata_result = set_log_metadata((int)$log->id, $job_metadata, true);
+if (!in_array($metadata_result['http_code'], [200, 201, 204])) {
+    debug("Failed to update log metadata: HTTP {$metadata_result['http_code']}");
+} else {
+    debug("Metadata added to resource log.");
 }
 
 echo "Charge created: €{$price}";
@@ -261,4 +288,45 @@ function create_charge(int $member_id, string $date_time, string $description, f
         $payload['resourceLog'] = $resource_log_id;
     }
     return call_api('POST', 'charges', $payload);
+}
+
+function set_log_metadata(int $resource_log_id, array $new_metadata, bool $merge = true): array {
+    $max_attempts = 5;
+    $attempt = 0;
+
+    do {
+        $attempt++;
+        $get_result = call_api("GET", "resource-logs/{$resource_log_id}");
+        if ($get_result['http_code'] !== 200) {
+            debug("Attempt #$attempt: Failed to load resource log (HTTP {$get_result['http_code']})");
+            return $get_result;
+        }
+
+        $lock_version = $get_result['data']->lockVersion ?? null;
+        if ($lock_version === null) {
+            debug("Attempt #$attempt: No lockVersion found in response.");
+            return ['http_code' => 400, 'data' => null, 'header' => []];
+        }
+
+        $existing_metadata = (array)($get_result['data']->metadata ?? []);
+        $merged_metadata = $merge
+            ? array_merge($existing_metadata, $new_metadata)
+            : $new_metadata;
+
+        $payload = [
+            'metadata'    => $merged_metadata,
+            'lockVersion' => $lock_version
+        ];
+
+        $put_result = call_api("PUT", "resource-logs/{$resource_log_id}", $payload);
+        if (in_array($put_result['http_code'], [200, 201, 204])) {
+            return $put_result;
+        }
+
+        debug("Attempt #$attempt: Failed to update metadata (HTTP {$put_result['http_code']}) – retrying...");
+
+        usleep(200_000); // Optional: 200ms delay before retry
+    } while ($attempt < $max_attempts);
+
+    return $put_result; // return last attempt's result
 }
