@@ -106,6 +106,37 @@ if ($print_job === null) {
     exit("Failed to fetch print job for printer serial {$resource_metadata->printer_serial}");
 }
 
+// === Parse timestamps ===
+$created_at_fabman = new DateTimeImmutable($log->createdAt);
+$stopped_at_fabman = new DateTimeImmutable($log->stoppedAt);
+
+$print_started_at = isset($print_job->print_started_at) ? new DateTimeImmutable($print_job->print_started_at) : null;
+$print_finished_at = isset($print_job->print_finished_at) ? new DateTimeImmutable($print_job->print_finished_at) : null;
+
+// === Perform plausibility check ===
+if (!$print_started_at || !$print_finished_at) {
+    debug("Print job has missing start or end timestamp – skipping.");
+    http_response_code(202);
+    exit("Missing Formlabs print timestamps.");
+}
+
+if (
+    $created_at_fabman > $print_started_at ||
+    $print_started_at > $print_finished_at ||
+    $print_finished_at > $stopped_at_fabman
+) {
+    debug("Timestamp order invalid:");
+    debug("Fabman createdAt      : " . $created_at_fabman->format(DateTime::ATOM));
+    debug("Formlabs start        : " . $print_started_at->format(DateTime::ATOM));
+    debug("Formlabs finish       : " . $print_finished_at->format(DateTime::ATOM));
+    debug("Fabman stoppedAt      : " . $stopped_at_fabman->format(DateTime::ATOM));
+    http_response_code(202);
+    exit("Timestamp order invalid – skipping print job.");
+}
+
+
+// === Calculate Price ===
+
 $material_code = $print_job->material ?? 'n/a';
 $volume_ml = $print_job->volume_ml ?? 0;
 
