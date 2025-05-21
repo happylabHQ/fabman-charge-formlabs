@@ -142,18 +142,10 @@ if (!in_array($result['http_code'], [200, 201, 204])) {
 }
 
 $job_metadata = [
-    "Formlabs Printjob" => [
-        "Print Name"   => $print_job->name ?? null,
-        "Material"     => $material_code,
-        "Volume (ml)"  => $volume_ml,
-        "Price (EUR)"  => $price,
-        "Started At"   => $print_job->print_started_at ?? null,
-        "Finished At"  => $print_job->print_finished_at ?? null,
-        "Job ID"       => $print_job->id ?? null,
-    ]
+    "Formlabs Printjob" => sanitize_print_job($print_job)
 ];
-
 debug("Setting metadata for resourceLog ID {$log->id}");
+debug("Metadata JSON size: " . strlen(json_encode($job_metadata)) . " bytes");
 $metadata_result = set_log_metadata((int)$log->id, $job_metadata, true);
 if (!in_array($metadata_result['http_code'], [200, 201, 204])) {
     debug("Failed to update log metadata: HTTP {$metadata_result['http_code']}");
@@ -329,4 +321,22 @@ function set_log_metadata(int $resource_log_id, array $new_metadata, bool $merge
     } while ($attempt < $max_attempts);
 
     return $put_result; // return last attempt's result
+}
+
+function sanitize_print_job($job): array {
+    return [
+        "Print Name"   => $job->name ?? null,
+        "Material"     => $job->material ?? null,
+        "Material Name"=> $job->material_name ?? null,
+        "Volume (ml)"  => isset($job->volume_ml) ? round($job->volume_ml, 2) : null,
+        "Started At"   => $job->print_started_at ?? null,
+        "Finished At"  => $job->print_finished_at ?? null,
+        "Printer"      => $job->printer ?? null,
+        "Status"       => $job->status ?? null,
+        "Layer Count"  => $job->layer_count ?? null,
+        "Layer Height" => $job->layer_thickness_mm ?? null,
+        "Estimated Duration (min)" => isset($job->estimated_duration_ms)
+            ? round($job->estimated_duration_ms / 60000)
+            : null,
+    ];
 }
