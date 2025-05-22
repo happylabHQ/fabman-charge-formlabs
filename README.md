@@ -91,6 +91,7 @@ In Fabman, under each resource, add metadata like:
 {
   "printer_serial": "LucidEel",
   "price_per_ml": 0.10,
+  "billing_mode": "surcharge",
   "FLCW4001": {
     "name": "CastableWax40",
     "price_per_ml": 0.23
@@ -100,14 +101,21 @@ In Fabman, under each resource, add metadata like:
     "price_per_ml": 0.13
   }
 }
+
 ```
 
+* `printer_serial` Serial number of the Formlabs printer.
 * `price_per_ml` is the **default fallback** price.
-* Each material code (e.g., `FLCW4001`) can define an **override price**.
+* Each material code (e.g., `FLCW4001`) can define an **override price** or a **base price** (see `billing_mode`).
+* `billing_mode` (optional):
+  * `"default"` (default) – Uses material-specific price if available
+  * `"surcharge"` – Always charges the base price (`price_per_ml`) plus a separate surcharge if a material-specific price is defined
 
 ---
 
 ## 🔢 Pricing Logic
+
+### Mode: "default" (default)
 
 The price is calculated as:
 
@@ -117,6 +125,15 @@ $price = round($volume_ml * $price_per_ml, 2);
 
 * If `$materialCode` exists in metadata, its `price_per_ml` is used
 * Otherwise, `price_per_ml` is used as fallback
+
+### Mode: "surcharge"
+
+Two separate charges are created:
+
+* **Base charge:** Always calculated with the general price_per_ml
+* **Surcharge** (if applicable): Only added if a material-specific `price_per_ml` is defined.
+
+This makes charges more transparent for end users, distinguishing basic and material-related costs.
 
 ---
 
