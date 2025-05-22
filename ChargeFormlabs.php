@@ -173,8 +173,21 @@ if (!in_array($result['http_code'], [200, 201, 204])) {
 }
 
 $job_metadata = [
-    "Formlabs Printjob" => sanitize_print_job($print_job)
+    "Formlabs Printjob" => array_merge(
+        sanitize_print_job($print_job),
+        [
+            "_billed" => [
+                "price_total_eur"    => $price,
+                "price_per_ml"       => $unit_price,
+                "volume_ml"          => $volume_ml,
+                "material_code"      => $material_code,
+                "material_name"      => $resource_metadata->{$material_code}->name ?? null,
+                "default_price_used" => !isset($resource_metadata->{$material_code}->price_per_ml),
+            ]
+        ]
+    )
 ];
+
 debug("Setting metadata for resourceLog ID {$log->id}");
 debug("Metadata JSON size: " . strlen(json_encode($job_metadata)) . " bytes");
 $metadata_result = set_log_metadata((int)$log->id, $job_metadata, true);
