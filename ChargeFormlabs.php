@@ -134,62 +134,77 @@ if (
     exit("Timestamp order invalid – skipping print job.");
 }
 
-
-// === Calculate Price ===
-
+// === Calculate Prices based on billing mode ===
 $material_code = $print_job->material ?? 'n/a';
 $volume_ml = $print_job->volume_ml ?? 0;
 
 debug("Material: $material_code, Volume: $volume_ml ml");
 
-if ($material_code && isset($resource_metadata->{$material_code}->price_per_ml)) {
-    $unit_price = $resource_metadata->{$material_code}->price_per_ml;
-    debug("Using material-specific price: $unit_price €/ml");
-} else {
-    $unit_price = $resource_metadata->price_per_ml;
-    debug("Using default price_per_ml: $unit_price €/ml");
-}
+$default_price_per_ml = $resource_metadata->price_per_ml;
+$material_price_per_ml = isset($resource_metadata->{$material_code}->price_per_ml)
+    ? $resource_metadata->{$material_code}->price_per_ml
+    : null;
 
-$price = round($volume_ml * $unit_price, 2);
-debug("Calculated price: €$price");
-
+$billing_mode = $resource_metadata->billing_mode ?? 'default';
+$base_price = round($volume_ml * $default_price_per_ml, 2);
 $member_id = (int)$log->member;
 $stopped_at = $log->stoppedAt;
 $date_time = strlen($stopped_at) === 10 ? $stopped_at . 'T00:00:00' : $stopped_at;
 $date_time = date("Y-m-d\TH:i:s", strtotime($date_time));
+$resource_name = $payload->details->resource->name ?? 'unknown device';
 
-$description = sprintf(
-    'Formlabs print "%s" on %s',
-    $print_job->name,
-    $payload->details->resource->name ?? 'unknown device'
-);
+if ($billing_mode === 'surcharge') {
+    debug("Billing mode: surcharge");
 
-debug("Creating charge for member ID $member_id on $date_time: $description");
+    // Charge 1: base price
+    $desc_base = sprintf('Formlabs print on %s (Base price)', $resource_name);
+    create_charge($member_id, $date_time, $desc_base, $base_price, (int)$log->id);
 
-$result = create_charge($member_id, $date_time, $description, $price, (int)$log->id);
-if (!in_array($result['http_code'], [200, 201, 204])) {
-    http_response_code(500);
-    exit("Failed to create charge: HTTP {$result['http_code']}");
+    // Charge 2: surcharge, if applicable
+    if ($material_price_per_ml !== null) {
+        $surcharge = round($volume_ml * ($material_price_per_ml - $default_price_per_ml), 2);
+        if ($surcharge > 0) {
+            $desc_surcharge = sprintf(
+                'Formlabs print on %s (Material surcharge: %s)',
+                $resource_name,
+                $resource_metadata->{$material_code}->name ?? $material_code
+            );
+            create_charge($member_id, $date_time, $desc_surcharge, $surcharge, (int)$log->id);
+            $total_price = $base_price + $surcharge;
+        } else {
+            $total_price = $base_price;
+        }
+    } else {
+        $total_price = $base_price;
+    }
+} else {
+    debug("Billing mode: default");
+    $unit_price = $material_price_per_ml ?? $default_price_per_ml;
+    $total_price = round($volume_ml * $unit_price, 2);
+
+    $desc = sprintf('Formlabs print "%s" on %s', $print_job->name, $resource_name);
+    create_charge($member_id, $date_time, $desc, $total_price, (int)$log->id);
 }
 
+// === Store metadata including billing mode and pricing ===
 $job_metadata = [
     "Formlabs Printjob" => array_merge(
         sanitize_print_job($print_job),
         [
             "_billed" => [
-                "price_total_eur"    => $price,
-                "price_per_ml"       => $unit_price,
+                "price_total_eur"    => $total_price,
                 "volume_ml"          => $volume_ml,
                 "material_code"      => $material_code,
                 "material_name"      => $resource_metadata->{$material_code}->name ?? null,
-                "default_price_used" => !isset($resource_metadata->{$material_code}->price_per_ml),
+                "billing_mode"       => $billing_mode,
+                "base_price_per_ml"  => $default_price_per_ml,
+                "material_price_per_ml" => $material_price_per_ml,
             ]
         ]
     )
 ];
 
 debug("Setting metadata for resourceLog ID {$log->id}");
-debug("Metadata JSON size: " . strlen(json_encode($job_metadata)) . " bytes");
 $metadata_result = set_log_metadata((int)$log->id, $job_metadata, true);
 if (!in_array($metadata_result['http_code'], [200, 201, 204])) {
     debug("Failed to update log metadata: HTTP {$metadata_result['http_code']}");
@@ -197,7 +212,7 @@ if (!in_array($metadata_result['http_code'], [200, 201, 204])) {
     debug("Metadata added to resource log.");
 }
 
-echo "Charge created: €{$price}";
+echo "Charge(s) created: €{$total_price}";
 
 // === Functions ===
 function formlabs_login(string $client_id, string $username, string $password): ?string {
