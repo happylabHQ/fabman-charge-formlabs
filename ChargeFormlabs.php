@@ -13,7 +13,8 @@
  *   {
  *     "FLFL8001": {"name": "Flexible80A", "price_per_ml": 0.13},
  *     "price_per_ml": 1.0,
- *     "printer_serial": "Form3XYZ"
+ *     "printer_serial": "Form3XYZ",
+ *     "billing_mode": "surcharge"
  *   }
  */
 
