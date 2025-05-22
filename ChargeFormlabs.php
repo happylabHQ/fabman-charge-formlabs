@@ -163,7 +163,7 @@ if ($billing_mode === 'surcharge') {
 
     // Charge 2: surcharge, if applicable
     if ($material_price_per_ml !== null) {
-        $surcharge = round($volume_ml * ($material_price_per_ml - $default_price_per_ml), 2);
+        $surcharge = round($volume_ml * $material_price_per_ml, 2);
         if ($surcharge > 0) {
             $desc_surcharge = sprintf(
                 'Formlabs print on %s (Material surcharge: %s)',
