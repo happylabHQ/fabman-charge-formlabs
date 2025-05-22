@@ -28,11 +28,12 @@ const FORMLABS_CLIENT_ID = 'your_formlabs_client_id';
 const FORMLABS_USER      = 'your_user_email@example.com';
 const FORMLABS_PASSWORD  = 'your_formlabs_password';
 
-date_default_timezone_set('Europe/Vienna');
-
 function debug(string $message): void {
     echo "[DEBUG] $message\n";
 }
+
+$currentTz = ini_get('date.timezone') ?: date_default_timezone_get();
+debug("Using timezone: $currentTz");
 
 // === Validate webhook token ===
 debug("Validating webhook token");
@@ -107,6 +108,7 @@ if ($print_job === null) {
     exit("Failed to fetch print job for printer serial {$resource_metadata->printer_serial}");
 }
 
+
 // === Parse timestamps ===
 $created_at_fabman = new DateTimeImmutable($log->createdAt);
 $stopped_at_fabman = new DateTimeImmutable($log->stoppedAt);
@@ -136,84 +138,106 @@ if (
 }
 
 // === Calculate Prices based on billing mode ===
-$material_code = $print_job->material ?? 'n/a';
-$volume_ml = $print_job->volume_ml ?? 0;
+$materialCode       = $print_job->material ?? 'n/a';
+$volumeMl           = $print_job->volume_ml ?? 0;
+$defaultPricePerMl  = $resource_metadata->price_per_ml;
+$materialPricePerMl = $resource_metadata->{$materialCode}->price_per_ml ?? null;
+$billingMode        = $resource_metadata->billing_mode ?? 'default';
 
-debug("Material: $material_code, Volume: $volume_ml ml");
+debug("Material: $materialCode, Volume: $volumeMl ml, Mode: $billingMode");
 
-$default_price_per_ml = $resource_metadata->price_per_ml;
-$material_price_per_ml = isset($resource_metadata->{$material_code}->price_per_ml)
-    ? $resource_metadata->{$material_code}->price_per_ml
-    : null;
+// Time & identifiers
+$memberId     = (int)$log->member;
+$stoppedAt    = $log->stoppedAt;
+$dateTime     = date(
+    "Y-m-d\TH:i:s",
+    strtotime(strlen($stoppedAt) === 10 ? "$stoppedAt T00:00:00" : $stoppedAt)
+);
+$resourceName = $payload->details->resource->name ?? 'unknown device';
 
-$billing_mode = $resource_metadata->billing_mode ?? 'default';
-$base_price = round($volume_ml * $default_price_per_ml, 2);
-$member_id = (int)$log->member;
-$stopped_at = $log->stoppedAt;
-$date_time = strlen($stopped_at) === 10 ? $stopped_at . 'T00:00:00' : $stopped_at;
-$date_time = date("Y-m-d\TH:i:s", strtotime($date_time));
-$resource_name = $payload->details->resource->name ?? 'unknown device';
+if ($billingMode === 'surcharge') {
+    // === Mode 2: Surcharge Mode ===
 
-if ($billing_mode === 'surcharge') {
-    debug("Billing mode: surcharge");
+    // 1) Always create base charge using default price
+    $basePrice = round($volumeMl * $defaultPricePerMl, 2);
+    $descBase  = sprintf(
+        'Formlabs print on %s (Base price @ %.2f/unit)',
+        $resourceName,
+        $defaultPricePerMl
+    );
+    create_charge($memberId, $dateTime, $descBase, $basePrice, (int)$log->id);
+    debug("Created base charge: $basePrice");
 
-    // Charge 1: base price
-    $desc_base = sprintf('Formlabs print on %s (Base price)', $resource_name);
-    create_charge($member_id, $date_time, $desc_base, $base_price, (int)$log->id);
-
-    // Charge 2: surcharge, if applicable
-    if ($material_price_per_ml !== null) {
-        $surcharge = round($volume_ml * $material_price_per_ml, 2);
-        if ($surcharge > 0) {
-            $desc_surcharge = sprintf(
-                'Formlabs print on %s (Material surcharge: %s)',
-                $resource_name,
-                $resource_metadata->{$material_code}->name ?? $material_code
-            );
-            create_charge($member_id, $date_time, $desc_surcharge, $surcharge, (int)$log->id);
-            $total_price = $base_price + $surcharge;
-        } else {
-            $total_price = $base_price;
-        }
-    } else {
-        $total_price = $base_price;
+    // 2) Always create material charge if material-specific price is set
+    if ($materialPricePerMl !== null) {
+        $surchargePrice = round($volumeMl * $materialPricePerMl, 2);
+        $matName         = $resource_metadata->{$materialCode}->name ?? $materialCode;
+        $descMaterial    = sprintf(
+            'Formlabs print on %s (Material surcharge: %s @ %.2f/unit)',
+            $resourceName,
+            $matName,
+            $materialPricePerMl
+        );
+        create_charge($memberId, $dateTime, $descMaterial, $surchargePrice, (int)$log->id);
+        debug("Created material surcharge: $surchargePrice");
     }
-} else {
-    debug("Billing mode: default");
-    $unit_price = $material_price_per_ml ?? $default_price_per_ml;
-    $total_price = round($volume_ml * $unit_price, 2);
 
-    $desc = sprintf('Formlabs print "%s" on %s', $print_job->name, $resource_name);
-    create_charge($member_id, $date_time, $desc, $total_price, (int)$log->id);
+} else {
+    // === Mode 1: Default Mode ===
+
+    $unitPrice = $materialPricePerMl ?? $defaultPricePerMl;
+    $price     = round($volumeMl * $unitPrice, 2);
+    $matName   = $materialPricePerMl !== null
+        ? ($resource_metadata->{$materialCode}->name ?? $materialCode)
+        : null;
+    $desc = sprintf(
+        'Formlabs print on %s%s @ %.2f/unit',
+        $resourceName,
+        $matName ? " ({$matName})" : '',
+        $unitPrice
+    );
+    create_charge($memberId, $dateTime, $desc, $price, (int)$log->id);
+    debug("Created single charge: $price");
 }
 
-// === Store metadata including billing mode and pricing ===
-$job_metadata = [
+// === Store metadata including pricing details ===
+$jobMetadata = [
     "Formlabs Printjob" => array_merge(
         sanitize_print_job($print_job),
         [
             "_billed" => [
-                "price_total_eur"    => $total_price,
-                "volume_ml"          => $volume_ml,
-                "material_code"      => $material_code,
-                "material_name"      => $resource_metadata->{$material_code}->name ?? null,
-                "billing_mode"       => $billing_mode,
-                "base_price_per_ml"  => $default_price_per_ml,
-                "material_price_per_ml" => $material_price_per_ml,
+                "base_price"            => $basePrice,
+                "surcharge_price    "   => $surchargePrice,
+                "volume_ml"             => round($volumeMl, 2),
+                "material_code"         => $materialCode,
+                "material_name"         => $resource_metadata->{$materialCode}->name ?? null,
+                "billing_mode"          => $billingMode,
+                "default_price_per_ml"  => $defaultPricePerMl,
+                "material_price_per_ml" => $materialPricePerMl,
             ]
         ]
     )
 ];
 
-debug("Setting metadata for resourceLog ID {$log->id}");
-$metadata_result = set_log_metadata((int)$log->id, $job_metadata, true);
-if (!in_array($metadata_result['http_code'], [200, 201, 204])) {
-    debug("Failed to update log metadata: HTTP {$metadata_result['http_code']}");
+debug("Updating metadata for resourceLog ID {$log->id}");
+$metadataResult = set_log_metadata((int)$log->id, $jobMetadata, true);
+if (in_array($metadataResult['http_code'], [200, 201, 204])) {
+    debug("Metadata successfully updated.");
 } else {
-    debug("Metadata added to resource log.");
+    debug("Failed to update metadata: HTTP {$metadataResult['http_code']}");
 }
 
-echo "Charge(s) created: €{$total_price}";
+// Return summary to webhook caller
+if ($billingMode === 'surcharge') {
+    echo sprintf(
+        "Charges created: Base €%.2f%s",
+        $basePrice,
+        $surchargePrice > 0 ? sprintf(" + Surcharge €%.2f", $surchargePrice) : ''
+    );
+} else {
+    echo sprintf("Charge created: €%.2f", $basePrice);
+}
+
 
 // === Functions ===
 function formlabs_login(string $client_id, string $username, string $password): ?string {
