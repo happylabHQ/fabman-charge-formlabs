@@ -18,15 +18,15 @@
  *   }
  */
 
-declare(strict_types=1);
-
 // === Configuration ===
-const WEBHOOK_TOKEN      = 'your_webhook_token';
-const FABMAN_API_URL     = 'https://fabman.io/api/v1/';
-const FABMAN_TOKEN       = 'your_fabman_api_token';
-const FORMLABS_CLIENT_ID = 'your_formlabs_client_id';
-const FORMLABS_USER      = 'your_user_email@example.com';
-const FORMLABS_PASSWORD  = 'your_formlabs_password';
+const WEBHOOK_TOKEN           = 'your_webhook_token';
+const FABMAN_API_URL          = 'https://fabman.io/api/v1/';
+const FABMAN_TOKEN            = 'your_fabman_api_token';
+const FORMLABS_CLIENT_ID      = 'your_formlabs_client_id';
+const FORMLABS_USER           = 'your_user_email@example.com';
+const FORMLABS_PASSWORD       = 'your_formlabs_password';
+const DESC_TEMPLATE_BASE      = '3D print %s on %s';
+const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
 
 function debug(string $message): void {
     echo "[DEBUG] $message\n";
@@ -57,6 +57,7 @@ if (!isset($payload->details->log)) {
 }
 
 $log = $payload->details->log;
+$logId = (int)$log->id;
 debug("Processing resource log ID: {$log->id}");
 
 if (isset($_GET['resources'])) {
@@ -86,7 +87,16 @@ if (isset($log->metadata->{'Formlabs Printjob'})) {
     exit("Job already processed – skipping.");
 }
 
-$resource_metadata = get_resource_metadata($resource_id);
+$result = call_api('GET', "resources/{$resource_id}");
+if ($result['http_code'] !== 200) {
+    http_response_code(500);
+    exit("Failed to fetch metadata for resource {$resource_id}");
+}
+$resource_metadata = $result['data']->metadata ?? null;
+if (!is_object($resource_metadata)) {
+    http_response_code(500);
+    exit("Invalid or missing metadata for resource {$resource_id}");
+}
 debug("Loaded resource metadata: " . json_encode($resource_metadata));
 
 if ($resource_metadata === false || !isset($resource_metadata->price_per_ml, $resource_metadata->printer_serial)) {
@@ -107,7 +117,6 @@ if ($print_job === null) {
     http_response_code(500);
     exit("Failed to fetch print job for printer serial {$resource_metadata->printer_serial}");
 }
-
 
 // === Parse timestamps ===
 $created_at_fabman = new DateTimeImmutable($log->createdAt);
@@ -138,6 +147,7 @@ if (
 }
 
 // === Calculate Prices based on billing mode ===
+$printName          = $print_job->name ?? "n/a";
 $materialCode       = $print_job->material ?? 'n/a';
 $volumeMl           = $print_job->volume_ml ?? 0;
 $defaultPricePerMl  = $resource_metadata->price_per_ml;
@@ -161,24 +171,28 @@ if ($billingMode === 'surcharge') {
     // 1) Always create base charge using default price
     $basePrice = round($volumeMl * $defaultPricePerMl, 2);
     $descBase  = sprintf(
-        'Formlabs print on %s (Base price @ %.2f/unit)',
+        DESC_TEMPLATE_BASE,
+        $printName,
         $resourceName,
-        $defaultPricePerMl
     );
-    create_charge($memberId, $dateTime, $descBase, $basePrice, (int)$log->id);
+
+    create_charge($memberId, $dateTime, $descBase, $basePrice, $logId);
     debug("Created base charge: $basePrice");
 
-    // 2) Always create material charge if material-specific price is set
+    // 2) Always create material surcharge if material-specific price is set
     if ($materialPricePerMl !== null) {
         $surchargePrice = round($volumeMl * $materialPricePerMl, 2);
         $matName         = $resource_metadata->{$materialCode}->name ?? $materialCode;
-        $descMaterial    = sprintf(
-            'Formlabs print on %s (Material surcharge: %s @ %.2f/unit)',
+        
+        $descSurcharge  = sprintf(
+            DESC_TEMPLATE_SURCHARGE,
+            $printName,
             $resourceName,
-            $matName,
-            $materialPricePerMl
+            $volumeMl,
+            $matName
         );
-        create_charge($memberId, $dateTime, $descMaterial, $surchargePrice, (int)$log->id);
+
+        create_charge($memberId, $dateTime, $descSurcharge, $surchargePrice, $logId);
         debug("Created material surcharge: $surchargePrice");
     }
 
@@ -190,13 +204,14 @@ if ($billingMode === 'surcharge') {
     $matName   = $materialPricePerMl !== null
         ? ($resource_metadata->{$materialCode}->name ?? $materialCode)
         : null;
-    $desc = sprintf(
-        'Formlabs print on %s%s @ %.2f/unit',
+        
+    $desc  = sprintf(
+        DESC_TEMPLATE_BASE,
+        $printName,
         $resourceName,
-        $matName ? " ({$matName})" : '',
-        $unitPrice
     );
-    create_charge($memberId, $dateTime, $desc, $price, (int)$log->id);
+
+    create_charge($memberId, $dateTime, $desc, $price, $logId);
     debug("Created single charge: $price");
 }
 
@@ -206,14 +221,14 @@ $jobMetadata = [
         sanitize_print_job($print_job),
         [
             "_billed" => [
-                "base_price"            => $basePrice,
-                "surcharge_price    "   => $surchargePrice,
+                "base_price"            => $basePrice ?? 0,
+                "surcharge_price    "   => $surchargePrice ?? 0,
                 "volume_ml"             => round($volumeMl, 2),
                 "material_code"         => $materialCode,
-                "material_name"         => $resource_metadata->{$materialCode}->name ?? null,
                 "billing_mode"          => $billingMode,
                 "default_price_per_ml"  => $defaultPricePerMl,
                 "material_price_per_ml" => $materialPricePerMl,
+                "print_name"            => $printName
             ]
         ]
     )
@@ -237,7 +252,6 @@ if ($billingMode === 'surcharge') {
 } else {
     echo sprintf("Charge created: €%.2f", $basePrice);
 }
-
 
 // === Functions ===
 function formlabs_login(string $client_id, string $username, string $password): ?string {
@@ -344,13 +358,6 @@ function call_api(string $method, string $endpoint, $data = null): array {
         'data' => json_decode($body),
         'header' => $header_text,
     ];
-}
-
-function get_resource_metadata(int $resource_id) {
-    $result = call_api('GET', "resources/{$resource_id}");
-    return ($result['http_code'] === 200)
-        ? ($result['data']->metadata ?? false)
-        : false;
 }
 
 function create_charge(int $member_id, string $date_time, string $description, float $price, int $resource_log_id = null): array {
