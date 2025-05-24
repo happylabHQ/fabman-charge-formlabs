@@ -46,12 +46,14 @@ This PHP script enables **automated billing** for **Formlabs 3D printers** throu
 2. **Configure constants** at the top of the script:
 
 ```php
-const WEBHOOK_TOKEN      = 'your_webhook_token';
-const FABMAN_API_URL     = 'https://fabman.io/api/v1/';
-const FABMAN_TOKEN       = 'your_fabman_api_token';
-const FORMLABS_CLIENT_ID = 'your_formlabs_client_id';
-const FORMLABS_USER      = 'your_user_email@example.com';
-const FORMLABS_PASSWORD  = 'your_formlabs_password';
+const WEBHOOK_TOKEN           = 'your_webhook_token';
+const FABMAN_API_URL          = 'https://fabman.io/api/v1/';
+const FABMAN_TOKEN            = 'your_fabman_api_token';
+const FORMLABS_CLIENT_ID      = 'your_formlabs_client_id';
+const FORMLABS_USER           = 'your_user_email@example.com';
+const FORMLABS_PASSWORD       = 'your_formlabs_password';
+const DESC_TEMPLATE_BASE      = '3D print %s on %s';
+const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
 ```
 
 3. **Define webhook** in Fabman:
