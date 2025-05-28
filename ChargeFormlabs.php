@@ -27,6 +27,16 @@ const FABMAN_TOKEN            = 'your_fabman_api_token';
 const FORMLABS_CLIENT_ID      = 'your_formlabs_client_id';
 const FORMLABS_USER           = 'your_user_email@example.com';
 const FORMLABS_PASSWORD       = 'your_formlabs_password';
+/*
+DESC_TEMPLATE_BASE:
+   %s → print job name
+   %s → Fabman resource name
+DESC_TEMPLATE_SURCHARGE:
+   %s → print job name
+   %s → Fabman resource name
+   %.2f → volume in ml
+   %s → material name
+*/
 const DESC_TEMPLATE_BASE      = '3D print %s on %s';
 const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
 
