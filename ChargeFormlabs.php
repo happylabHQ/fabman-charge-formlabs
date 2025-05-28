@@ -8,8 +8,8 @@
  *   POST /ChargeFormlabs.php?secret=...&resources=1322,1516
  *
  * Notes:
- * - Charges are only created for resources listed in ?resources parameter.
- * - Material-specific pricing is supported via resource metadata:
+ * - Charges are only created for resources listed in the ?resources parameter.
+ * - Material-specific pricing is supported via resource metadata, for example:
  *   {
  *     "FLFL8001": {"name": "Flexible80A", "price_per_ml": 0.13},
  *     "price_per_ml": 1.0,
@@ -17,6 +17,8 @@
  *     "billing_mode": "surcharge"
  *   }
  */
+
+declare(strict_types=1);
 
 // === Configuration ===
 const WEBHOOK_TOKEN           = 'your_webhook_token';
@@ -28,288 +30,436 @@ const FORMLABS_PASSWORD       = 'your_formlabs_password';
 const DESC_TEMPLATE_BASE      = '3D print %s on %s';
 const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
 
-function debug(string $message): void {
-    echo "[DEBUG] $message\n";
+/**
+ * Logs debug messages to output.
+ */
+function debugLog(string $message): void
+{
+    echo "[DEBUG] {$message}\n";
 }
 
-$currentTz = ini_get('date.timezone') ?: date_default_timezone_get();
-debug("Using timezone: $currentTz");
+// Set default timezone
+$currentTimezone = ini_get('date.timezone') ?: date_default_timezone_get();
+debugLog("Using timezone: {$currentTimezone}");
 
 // === Validate webhook token ===
-debug("Validating webhook token");
+debugLog('Validating webhook token');
 if (!isset($_GET['secret']) || $_GET['secret'] !== WEBHOOK_TOKEN) {
     http_response_code(403);
     exit('Invalid webhook token.');
 }
 
-// === Parse JSON payload ===
-debug("Reading payload");
-$input = file_get_contents('php://input');
+// === Read and parse JSON payload ===
+debugLog('Reading payload');
+$input   = file_get_contents('php://input');
 $payload = json_decode($input);
 if (json_last_error() !== JSON_ERROR_NONE) {
     http_response_code(400);
     exit('Invalid JSON payload.');
-} 
+}
+
+$type = $payload->type ?? null;
+if (!in_array($type, ['resourceLog_created', 'resourceLog_updated'], true)) {
+    http_response_code(202);
+    exit("Webhook type {$type} not processed.");
+}
 
 if (!isset($payload->details->log)) {
     http_response_code(202);
     exit('Missing log data in payload.');
 }
 
-$log = $payload->details->log;
-$logId = (int)$log->id;
-debug("Processing resource log ID: {$log->id}");
+$logEntry = $payload->details->log;
+$logId    = (int) $logEntry->id;
+debugLog("Processing resource log ID: {$logId}");
 
+// === Allowed resources ===
 if (isset($_GET['resources'])) {
-    $allowed_resources = array_map('intval', explode(',', $_GET['resources']));
-    debug("Allowed resource IDs: " . implode(',', $allowed_resources));
+    $allowedResources = array_map('intval', explode(',', (string) $_GET['resources']));
+    debugLog('Allowed resource IDs: ' . implode(',', $allowedResources));
 } else {
     http_response_code(202);
-    exit("IDs of the resources to be considered must be provided as a URL parameter: ?resources=1322,1516");
+    exit('Resource IDs must be provided as a URL parameter: ?resources=1322,1516');
 }
 
-$resource_id = (int)$log->resource;
-debug("Resource ID: {$resource_id}");
+$resourceId = (int) $logEntry->resource;
+debugLog("Resource ID: {$resourceId}");
 
-if (!in_array($resource_id, $allowed_resources, true)) {
+if (!in_array($resourceId, $allowedResources, true)) {
     http_response_code(202);
-    exit("Resource ID $resource_id is not handled by this webhook.");
+    exit("Resource ID {$resourceId} is not handled by this webhook.");
 }
 
-if (!isset($log->stopType)) {
+if (!isset($logEntry->stopType)) {
     http_response_code(202);
     exit('Event is not a stop; nothing to do.');
 }
 
-if (isset($log->metadata->{'Formlabs Printjob'})) {
-    debug("Metadata already contains 'Formlabs Printjob'. Skipping billing.");
+if (isset($logEntry->metadata->{'Formlabs Printjob'})) {
+    debugLog("Metadata already contains 'Formlabs Printjob'; skipping billing.");
     http_response_code(202);
-    exit("Job already processed – skipping.");
+    exit('Job already processed – skipping.');
 }
 
-$result = call_api('GET', "resources/{$resource_id}");
-if ($result['http_code'] !== 200) {
+// === Fetch resource metadata from Fabman ===
+$response = callFabmanApi('GET', "resources/{$resourceId}");
+if ($response['http_code'] !== 200) {
     http_response_code(500);
-    exit("Failed to fetch metadata for resource {$resource_id}");
+    exit("Failed to fetch metadata for resource {$resourceId}.");
 }
-$resource_metadata = $result['data']->metadata ?? null;
-if (!is_object($resource_metadata)) {
+
+$resourceMetadata = $response['data']->metadata ?? null;
+if (!is_object($resourceMetadata) ||
+    !isset($resourceMetadata->price_per_ml, $resourceMetadata->printer_serial)) {
     http_response_code(500);
-    exit("Invalid or missing metadata for resource {$resource_id}");
+    exit("Invalid or missing metadata for resource {$resourceId}.");
 }
-debug("Loaded resource metadata: " . json_encode($resource_metadata));
+debugLog('Loaded resource metadata: ' . json_encode($resourceMetadata));
 
-if ($resource_metadata === false || !isset($resource_metadata->price_per_ml, $resource_metadata->printer_serial)) {
-    http_response_code(202);
-    exit("Missing metadata for resource #{$resource_id}");
-}
-
-$access_token = formlabs_login(FORMLABS_CLIENT_ID, FORMLABS_USER, FORMLABS_PASSWORD);
-debug("Obtained Formlabs access token: " . ($access_token ? 'yes' : 'no'));
-if ($access_token === null) {
+// === Authenticate with Formlabs ===
+$accessToken = formLabsLogin(FORMLABS_CLIENT_ID, FORMLABS_USER, FORMLABS_PASSWORD);
+debugLog('Obtained Formlabs access token: ' . ($accessToken !== null ? 'yes' : 'no'));
+if ($accessToken === null) {
     http_response_code(500);
     exit('Server error: Formlabs authentication failed.');
 }
 
-$print_job = formlabs_get($access_token, $resource_metadata->printer_serial);
-debug("Fetched print job: " . json_encode($print_job));
-if ($print_job === null) {
-    http_response_code(500);
-    exit("Failed to fetch print job for printer serial {$resource_metadata->printer_serial}");
-}
+// === Activity timestamps ===
+$activityStart = new DateTimeImmutable($logEntry->createdAt);
+$activityEnd   = new DateTimeImmutable($logEntry->stoppedAt);
 
-// === Parse timestamps ===
-$created_at_fabman = new DateTimeImmutable($log->createdAt);
-$stopped_at_fabman = new DateTimeImmutable($log->stoppedAt);
-
-$print_started_at = isset($print_job->print_started_at) ? new DateTimeImmutable($print_job->print_started_at) : null;
-$print_finished_at = isset($print_job->print_finished_at) ? new DateTimeImmutable($print_job->print_finished_at) : null;
-
-// === Perform plausibility check ===
-if (!$print_started_at || !$print_finished_at) {
-    debug("Print job has missing start or end timestamp – skipping.");
-    http_response_code(202);
-    exit("Missing Formlabs print timestamps.");
-}
-
-if (
-    $created_at_fabman > $print_started_at ||
-    $print_started_at > $print_finished_at ||
-    $print_finished_at > $stopped_at_fabman
-) {
-    debug("Timestamp order invalid:");
-    debug("Fabman createdAt      : " . $created_at_fabman->format(DateTime::ATOM));
-    debug("Formlabs start        : " . $print_started_at->format(DateTime::ATOM));
-    debug("Formlabs finish       : " . $print_finished_at->format(DateTime::ATOM));
-    debug("Fabman stoppedAt      : " . $stopped_at_fabman->format(DateTime::ATOM));
-    http_response_code(202);
-    exit("Timestamp order invalid – skipping print job.");
-}
-
-// === Calculate Prices based on billing mode ===
-$printName          = $print_job->name ?? "n/a";
-$materialCode       = $print_job->material ?? 'n/a';
-$volumeMl           = $print_job->volume_ml ?? 0;
-$defaultPricePerMl  = $resource_metadata->price_per_ml;
-$materialPricePerMl = $resource_metadata->{$materialCode}->price_per_ml ?? null;
-$billingMode        = $resource_metadata->billing_mode ?? 'default';
-
-debug("Material: $materialCode, Volume: $volumeMl ml, Mode: $billingMode");
-
-// Time & identifiers
-$memberId     = (int)$log->member;
-$stoppedAt    = $log->stoppedAt;
-$dateTime     = date(
-    "Y-m-d\TH:i:s",
-    strtotime(strlen($stoppedAt) === 10 ? "$stoppedAt T00:00:00" : $stoppedAt)
+// === Fetch prints from Formlabs ===
+$prints = formLabsGetPrints(
+    $accessToken,
+    $resourceMetadata->printer_serial,
+    $activityStart,
+    $activityEnd
 );
+debugLog('Fetched print jobs: ' . json_encode($prints));
+if ($prints === null) {
+    http_response_code(500);
+    exit("Failed to fetch prints for printer {$resourceMetadata->printer_serial}.");
+}
+
+$memberId     = (int) $logEntry->member;
+$printCount   = count($prints);
 $resourceName = $payload->details->resource->name ?? 'unknown device';
 
-if ($billingMode === 'surcharge') {
-    // === Mode 2: Surcharge Mode ===
-
-    // 1) Always create base charge using default price
-    $basePrice = round($volumeMl * $defaultPricePerMl, 2);
-    $descBase  = sprintf(
-        DESC_TEMPLATE_BASE,
-        $printName,
-        $resourceName,
+if ($printCount === 0) {
+    http_response_code(202);
+    exit('No Formlabs prints during this activity.');
+} elseif ($printCount === 1) {
+    processSinglePrintJob(
+        $prints[0],
+        $logId,
+        $memberId,
+        $activityStart,
+        $activityEnd,
+        $resourceMetadata,
+        $resourceName
     );
-
-    create_charge($memberId, $dateTime, $descBase, $basePrice, $logId);
-    debug("Created base charge: $basePrice");
-
-    // 2) Always create material surcharge if material-specific price is set
-    if ($materialPricePerMl !== null) {
-        $surchargePrice = round($volumeMl * $materialPricePerMl, 2);
-        $matName         = $resource_metadata->{$materialCode}->name ?? $materialCode;
-        
-        $descSurcharge  = sprintf(
-            DESC_TEMPLATE_SURCHARGE,
-            $printName,
-            $resourceName,
-            $volumeMl,
-            $matName
-        );
-
-        create_charge($memberId, $dateTime, $descSurcharge, $surchargePrice, $logId);
-        debug("Created material surcharge: $surchargePrice");
+} else {
+    debugLog("Multiple print jobs found: {$printCount}");
+    foreach ($prints as $printJob) {
+        $jobName    = $printJob->name              ?? 'n/a';
+        $startedAt  = $printJob->print_started_at  ?? 'n/a';
+        $finishedAt = $printJob->print_finished_at ?? 'n/a';
+        echo "{$startedAt}\t{$finishedAt}\t{$jobName}\n";
     }
 
-} else {
-    // === Mode 1: Default Mode ===
+    $deleteResult = callFabmanApi('DELETE', "resource-logs/{$logId}");
+    if ($deleteResult['http_code'] !== 204) {
+        http_response_code(500);
+        exit("Failed to delete original activity {$logId}.");
+    }
 
-    $unitPrice = $materialPricePerMl ?? $defaultPricePerMl;
-    $price     = round($volumeMl * $unitPrice, 2);
-    $matName   = $materialPricePerMl !== null
-        ? ($resource_metadata->{$materialCode}->name ?? $materialCode)
+    foreach ($prints as $printJob) {
+        $pjStart = new DateTimeImmutable($printJob->print_started_at);
+        $pjEnd   = !empty($printJob->print_finished_at)
+            ? new DateTimeImmutable($printJob->print_finished_at)
+            : new DateTimeImmutable();
+
+        $createdAtUtc = $pjStart->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
+        $stoppedAtUtc = $pjEnd  ->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
+
+        $newLogPayload = [
+            'resource'  => $resourceId,
+            'member'    => $memberId,
+            'createdAt' => $createdAtUtc,
+            'stoppedAt' => $stoppedAtUtc,
+        ];
+
+        $createLog = callFabmanApi('POST', 'resource-logs', $newLogPayload);
+        if ($createLog['http_code'] !== 201) {
+            debugLog("Failed to create new activity for job {$printJob->id}");
+            continue;
+        }
+    }
+
+    exit("Split Fabman activity into {$printCount} separate activities according to Formlabs prints.");
+}
+
+// === Core Functions ===
+
+/**
+ * Processes a single print job: validates timestamps, computes pricing,
+ * creates charges, updates metadata, and shrinks the activity duration.
+ */
+function processSinglePrintJob(
+    object                $printJob,
+    int                   $logId,
+    int                   $memberId,
+    DateTimeImmutable     $activityStart,
+    DateTimeImmutable     $activityEnd,
+    object                $resourceMetadata,
+    string                $resourceName
+): void {
+    global $currentTimezone;
+
+    // Parse timestamps
+    $printStartedAt  = isset($printJob->print_started_at)
+        ? new DateTimeImmutable($printJob->print_started_at)
         : null;
-        
-    $desc  = sprintf(
-        DESC_TEMPLATE_BASE,
+    $printFinishedAt = isset($printJob->print_finished_at)
+        ? new DateTimeImmutable($printJob->print_finished_at)
+        : null;
+
+    // Validate timestamps
+    if (!$printStartedAt || !$printFinishedAt) {
+        debugLog('Print job missing timestamps; skipping.');
+        http_response_code(202);
+        exit('Missing Formlabs print timestamps.');
+    }
+
+    if (
+        $activityStart > $printStartedAt ||
+        $printStartedAt > $printFinishedAt ||
+        $printFinishedAt > $activityEnd
+    ) {
+        debugLog('Invalid timestamp order; skipping print job.');
+        http_response_code(202);
+        exit('Timestamp order invalid; skipping print job.');
+    }
+
+    // Extract pricing data
+    $printName           = $printJob->name                          ?? 'n/a';
+    $materialCode        = $printJob->material                      ?? 'n/a';
+    $volumeMl            = $printJob->volume_ml                     ?? 0.0;
+    $defaultPricePerMl   = $resourceMetadata->price_per_ml;
+    $materialPricePerMl  = $resourceMetadata->{$materialCode}->price_per_ml ?? null;
+    $billingMode         = $resourceMetadata->billing_mode          ?? 'default';
+
+    debugLog(sprintf(
+        "Processing print '%s': material=%s, volume=%.2fml, mode=%s",
         $printName,
-        $resourceName,
-    );
+        $materialCode,
+        $volumeMl,
+        $billingMode
+    ));
 
-    create_charge($memberId, $dateTime, $desc, $price, $logId);
-    debug("Created single charge: $price");
+    // Determine charge timestamp (end of print)
+    $chargeDateTime = $printFinishedAt
+        ->setTimezone(new DateTimeZone($currentTimezone))
+        ->format('Y-m-d\TH:i');
+    debugLog("Charge dateTime: {$chargeDateTime}");
+
+    // Billing logic: surcharge vs default
+    if ($billingMode === 'surcharge') {
+        // Base charge
+        $basePrice = round($volumeMl * $defaultPricePerMl, 2);
+        $descBase  = sprintf(DESC_TEMPLATE_BASE, $printName, $resourceName);
+        $resBase   = createFabmanCharge($memberId, $chargeDateTime, $descBase, $basePrice, $logId);        
+        handleChargeResult($resBase, $basePrice, 'base');
+
+        // Additional material surcharge
+        if ($materialPricePerMl !== null) {
+            $surchargePrice = round($volumeMl * $materialPricePerMl, 2);
+            $matName        = $resourceMetadata->{$materialCode}->name ?? $materialCode;
+            $descSurch      = sprintf(DESC_TEMPLATE_SURCHARGE,
+                $printName,
+                $resourceName,
+                $volumeMl,
+                $matName
+            );
+            $resSurch       = createFabmanCharge($memberId, $chargeDateTime, $descSurch, $surchargePrice, null);
+            handleChargeResult($resSurch, $surchargePrice, 'surcharge');
+        }
+    } else {
+        // Single combined charge
+        $unitPrice  = $materialPricePerMl ?? $defaultPricePerMl;
+        $totalPrice = round($volumeMl * $unitPrice, 2);
+        $desc       = sprintf(DESC_TEMPLATE_BASE, $printName, $resourceName);
+        $res        = createFabmanCharge($memberId, $chargeDateTime, $desc, $totalPrice, $logId);
+        handleChargeResult($res, $totalPrice, 'single');
+    }
+
+    // Update activity metadata and shrink duration
+    $jobMeta = [
+        'Formlabs Printjob' => array_merge(
+            sanitizePrintJob($printJob),
+            ['_billed' => [
+                'base_price'            => $basePrice ?? 0,
+                'surcharge_price'       => $surchargePrice ?? 0,
+                'volume_ml'             => round($volumeMl, 2),
+                'material_code'         => $materialCode,
+                'billing_mode'          => $billingMode,
+                'default_price_per_ml'  => $defaultPricePerMl,
+                'material_price_per_ml' => $materialPricePerMl,
+                'print_name'            => $printName,
+            ]]
+        )
+    ];
+
+    $createdAtUtc = $printStartedAt
+        ->setTimezone(new DateTimeZone('UTC'))
+        ->format('Y-m-d\TH:i:s\Z');
+    $stoppedAtUtc = $printFinishedAt
+        ->setTimezone(new DateTimeZone('UTC'))
+        ->format('Y-m-d\TH:i:s\Z');
+
+    debugLog("Updating activity {$logId} to print duration and metadata");
+    $updRes = updateActivity($logId, $createdAtUtc, $stoppedAtUtc, $jobMeta, true);
+    if (!in_array($updRes['http_code'], [200, 201, 204], true)) {
+        debugLog("Failed to update metadata: HTTP {$updRes['http_code']}");
+    }
+
+    // Output result summary
+    echo ($billingMode === 'surcharge')
+        ? sprintf("Charges created: Base €%.2f + Surcharge €%.2f", $basePrice, $surchargePrice)
+        : sprintf("Charge created: €%.2f", $totalPrice);
 }
 
-// === Store metadata including pricing details ===
-$jobMetadata = [
-    "Formlabs Printjob" => array_merge(
-        sanitize_print_job($print_job),
-        [
-            "_billed" => [
-                "base_price"            => $basePrice ?? 0,
-                "surcharge_price    "   => $surchargePrice ?? 0,
-                "volume_ml"             => round($volumeMl, 2),
-                "material_code"         => $materialCode,
-                "billing_mode"          => $billingMode,
-                "default_price_per_ml"  => $defaultPricePerMl,
-                "material_price_per_ml" => $materialPricePerMl,
-                "print_name"            => $printName
-            ]
-        ]
-    )
-];
-
-debug("Updating metadata for resourceLog ID {$log->id}");
-$metadataResult = set_log_metadata((int)$log->id, $jobMetadata, true);
-if (in_array($metadataResult['http_code'], [200, 201, 204])) {
-    debug("Metadata successfully updated.");
-} else {
-    debug("Failed to update metadata: HTTP {$metadataResult['http_code']}");
+/**
+ * Handles API charge results, exiting on error.
+ */
+function handleChargeResult(array $response, float $amount, string $type): void
+{
+    if ($response['http_code'] !== 201) {
+        $errorMsg = sprintf(
+            'Failed to create %s charge: HTTP %d, Response: %s',
+            $type,
+            $response['http_code'],
+            json_encode($response['data'])
+        );
+        debugLog($errorMsg);
+        http_response_code(500);
+        exit('Billing error: ' . $errorMsg);
+    }
+    debugLog(sprintf('Created %s charge: € %.2f', $type, $amount));
 }
 
-// Return summary to webhook caller
-if ($billingMode === 'surcharge') {
-    echo sprintf(
-        "Charges created: Base €%.2f%s",
-        $basePrice,
-        $surchargePrice > 0 ? sprintf(" + Surcharge €%.2f", $surchargePrice) : ''
-    );
-} else {
-    echo sprintf("Charge created: €%.2f", $basePrice);
-}
-
-// === Functions ===
-function formlabs_login(string $client_id, string $username, string $password): ?string {
-    $url = 'https://api.formlabs.com/developer/v1/o/token/';
-    $post_data = http_build_query([
+/**
+ * Authenticates with Formlabs and returns an access token.
+ */
+function formLabsLogin(string $clientId, string $username, string $password): ?string
+{
+    $url  = 'https://api.formlabs.com/developer/v1/o/token/';
+    $post = http_build_query([
         'grant_type' => 'password',
-        'client_id' => $client_id,
-        'username' => $username,
-        'password' => $password,
+        'client_id'  => $clientId,
+        'username'   => $username,
+        'password'   => $password,
     ]);
 
     $ch = curl_init($url);
     curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $post_data,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $post,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
     ]);
 
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($response === false || $http_code !== 200) {
-        error_log("Formlabs login failed: HTTP $http_code");
+    if ($resp === false || $code !== 200) {
+        error_log("Formlabs login failed: HTTP $code");
         return null;
     }
 
-    $data = json_decode($response);
+    $data = json_decode($resp);
     return $data->access_token ?? null;
 }
 
-function formlabs_get(string $access_token, string $printer_serial) {
-    $url = "https://api.formlabs.com/developer/v1/printers/{$printer_serial}/prints/";
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => ["Authorization: Bearer {$access_token}"],
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
-    ]);
+/**
+ * Retrieves completed print jobs from Formlabs within a time window.
+ */
+function formLabsGetPrints(string $accessToken, string $printerSerial, DateTimeInterface $from, DateTimeInterface $to): ?array
+{
+    $perPage = 100;
+    $page    = 1;
+    $all     = [];
 
-    $response = curl_exec($ch);
-    curl_close($ch);
+    $fromStr = $from->format('Y-m-d\TH:i:s\Z');
+    $toStr   = $to  ->format('Y-m-d\TH:i:s\Z');
 
-    if ($response === false) {
-        return null;
-    }
+    do {
+        $url = sprintf(
+            'https://api.formlabs.com/developer/v1/printers/%s/prints/?date__gt=%s&date__lt=%s&per_page=%d&page=%d',
+            urlencode($printerSerial),
+            urlencode($fromStr),
+            urlencode($toStr),
+            $perPage,
+            $page
+        );
+        debugLog("Calling Formlabs API: {$url}");
 
-    $data = json_decode($response);
-    return $data->results[0] ?? null;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => ["Authorization: Bearer {$accessToken}"],
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+        ]);
+
+        $resp = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($resp === false || $code !== 200) {
+            debugLog("Formlabs API error: HTTP {$code}");
+            return null;
+        }
+
+        $data = json_decode($resp);
+        if (json_last_error() !== JSON_ERROR_NONE || !isset($data->results)) {
+            debugLog("Formlabs API: invalid response");
+            return null;
+        }
+
+        foreach ($data->results as $pj) {
+            if (empty($pj->print_started_at) || empty($pj->print_finished_at)) {
+                continue;
+            }
+            try {
+                $start = new DateTimeImmutable($pj->print_started_at);
+                $end   = new DateTimeImmutable($pj->print_finished_at);
+            } catch (Exception $e) {
+                debugLog("Invalid date in job {$pj->guid}: {$e->getMessage()}");
+                continue;
+            }
+            if ($start >= $from && $end <= $to) {
+                $all[] = $pj;
+            }
+        }
+
+        $fetched = count($data->results);
+        $page++;
+    } while ($fetched === $perPage);
+
+    return $all;
 }
 
-function call_api(string $method, string $endpoint, $data = null): array {
-    $url = rtrim(FABMAN_API_URL, '/') . '/' . ltrim($endpoint, '/');
-    $ch = curl_init();
+/**
+ * Generic API caller for Fabman endpoints.
+ */
+function callFabmanApi(string $method, string $endpoint, $data = null): array
+{
+    $url     = rtrim(FABMAN_API_URL, '/') . '/' . ltrim($endpoint, '/');
+    $ch      = curl_init();
     $headers = ['Authorization: Bearer ' . FABMAN_TOKEN];
 
     switch (strtoupper($method)) {
@@ -339,95 +489,98 @@ function call_api(string $method, string $endpoint, $data = null): array {
     }
 
     curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
+        CURLOPT_URL            => $url,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_HEADER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_HTTPHEADER     => $headers,
     ]);
 
-    $response = curl_exec($ch);
-    $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $response    = curl_exec($ch);
+    $headerSize  = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $httpCode    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    $header_text = substr($response, 0, $header_size);
-    $body = substr($response, $header_size);
-
+    $body = substr($response, $headerSize);
     return [
-        'http_code' => $http_code,
-        'data' => json_decode($body),
-        'header' => $header_text,
+        'http_code' => $httpCode,
+        'data'      => json_decode($body),
+        'header'    => substr($response, 0, $headerSize),
     ];
 }
 
-function create_charge(int $member_id, string $date_time, string $description, float $price, int $resource_log_id = null): array {
+/**
+ * Creates a charge in Fabman for the given member.
+ */
+function createFabmanCharge(int $memberId, string $dateTime, string $description, float $price, int $resourceLogId = null): array
+{
     $payload = [
-        'member' => $member_id,
-        'dateTime' => $date_time,
+        'member'      => $memberId,
+        'dateTime'    => $dateTime,
         'description' => $description,
-        'price' => $price,
+        'price'       => $price,
     ];
-    if ($resource_log_id !== null) {
-        $payload['resourceLog'] = $resource_log_id;
+    if ($resourceLogId !== null) {
+        $payload['resourceLog'] = $resourceLogId;
     }
-    return call_api('POST', 'charges', $payload);
+    return callFabmanApi('POST', 'charges', $payload);
 }
 
-function set_log_metadata(int $resource_log_id, array $new_metadata, bool $merge = true): array {
-    $max_attempts = 5;
-    $attempt = 0;
+/**
+ * Updates a resource-log activity with new timestamps and metadata.
+ */
+function updateActivity(int $resourceLogId, string $createdAt, string $stoppedAt, array $newMetadata, bool $merge = true): array
+{
+    $maxAttempts = 5;
+    $attempt     = 0;
 
     do {
         $attempt++;
-        $get_result = call_api("GET", "resource-logs/{$resource_log_id}");
-        if ($get_result['http_code'] !== 200) {
-            debug("Attempt #$attempt: Failed to load resource log (HTTP {$get_result['http_code']})");
-            return $get_result;
+        $getRes = callFabmanApi('GET', "resource-logs/{$resourceLogId}");
+        if ($getRes['http_code'] !== 200) {
+            debugLog("Attempt #{$attempt}: failed to load resource log (HTTP {$getRes['http_code']})");
+            return $getRes;
         }
 
-        $lock_version = $get_result['data']->lockVersion ?? null;
-        if ($lock_version === null) {
-            debug("Attempt #$attempt: No lockVersion found in response.");
-            return ['http_code' => 400, 'data' => null, 'header' => []];
-        }
-
-        $existing_metadata = (array)($get_result['data']->metadata ?? []);
-        $merged_metadata = $merge
-            ? array_merge($existing_metadata, $new_metadata)
-            : $new_metadata;
+        $lockVersion       = $getRes['data']->lockVersion ?? null;
+        $existingMetadata  = (array)($getRes['data']->metadata ?? []);
+        $mergedMetadata    = $merge ? array_merge($existingMetadata, $newMetadata) : $newMetadata;
 
         $payload = [
-            'metadata'    => $merged_metadata,
-            'lockVersion' => $lock_version
+            'createdAt'   => $createdAt,
+            'stoppedAt'   => $stoppedAt,
+            'metadata'    => $mergedMetadata,
+            'lockVersion' => $lockVersion,
         ];
 
-        $put_result = call_api("PUT", "resource-logs/{$resource_log_id}", $payload);
-        if (in_array($put_result['http_code'], [200, 201, 204])) {
-            return $put_result;
+        $putRes = callFabmanApi('PUT', "resource-logs/{$resourceLogId}", $payload);
+        if (in_array($putRes['http_code'], [200, 201, 204], true)) {
+            return $putRes;
         }
+        debugLog("Attempt #{$attempt}: failed to update metadata (HTTP {$putRes['http_code']}); retrying...");
+        usleep(200000);
+    } while ($attempt < $maxAttempts);
 
-        debug("Attempt #$attempt: Failed to update metadata (HTTP {$put_result['http_code']}) – retrying...");
-
-        usleep(200_000); // Optional: 200ms delay before retry
-    } while ($attempt < $max_attempts);
-
-    return $put_result; // return last attempt's result
+    return $putRes;
 }
 
-function sanitize_print_job($job): array {
+/**
+ * Sanitizes a Formlabs print job for metadata storage.
+ */
+function sanitizePrintJob(object $job): array
+{
     return [
-        "Print Name"   => $job->name ?? null,
-        "Material"     => $job->material ?? null,
-        "Material Name"=> $job->material_name ?? null,
-        "Volume (ml)"  => isset($job->volume_ml) ? round($job->volume_ml, 2) : null,
-        "Started At"   => $job->print_started_at ?? null,
-        "Finished At"  => $job->print_finished_at ?? null,
-        "Printer"      => $job->printer ?? null,
-        "Status"       => $job->status ?? null,
-        "Layer Count"  => $job->layer_count ?? null,
-        "Layer Height" => $job->layer_thickness_mm ?? null,
-        "Estimated Duration (min)" => isset($job->estimated_duration_ms)
-            ? round($job->estimated_duration_ms / 60000)
+        'printName'            => $job->name               ?? null,
+        'material'             => $job->material           ?? null,
+        'materialName'         => $job->material_name      ?? null,
+        'volumeMl'             => isset($job->volume_ml)   ? round($job->volume_ml, 2) : null,
+        'startedAt'            => $job->print_started_at   ?? null,
+        'finishedAt'           => $job->print_finished_at  ?? null,
+        'printer'              => $job->printer            ?? null,
+        'status'               => $job->status             ?? null,
+        'layerCount'           => $job->layer_count        ?? null,
+        'layerHeightMm'        => $job->layer_thickness_mm ?? null,
+        'estimatedDurationMin' => isset($job->estimated_duration_ms)
+            ? (int) round($job->estimated_duration_ms / 60000)
             : null,
     ];
 }
