@@ -19,6 +19,7 @@ This PHP script enables **automated billing** for **Formlabs 3D printers** throu
 * Material-based or fallback per-ml pricing
 * Formlabs API integration
 * Works with multiple printers via `?resources=` parameter
+* Splits a single Fabman activity into per-printjob activities when multiple prints occur
 * Structured debug logging
 
 ---
@@ -56,6 +57,12 @@ const DESC_TEMPLATE_BASE      = '3D print %s on %s';
 const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
 ```
 
+You can override the default charge description formats by editing these constants in the script:
+  * %s → print job name
+  * %s → Fabman resource name
+  * %.2f → (surcharge only) volume in ml
+  * %s → (surcharge only) material name
+
 3. **Define webhook** in Fabman:
 
    * Event: `resourceLog_created` or `resourceLog_updated`
@@ -79,9 +86,6 @@ To ensure charges are triggered **after a print finishes**, we recommend the fol
 
 These settings ensure the printer powers down a few minutes after the print finishes.  
 The power-off event will trigger a `resourceLog_updated` webhook — causing the charge to be created.
-
-> ⚠️ Only the **latest print job** from the printer is used for billing.  
-> Therefore, it's essential that the Fabman bridge is powered off **after each print job** — either **automatically** via idle timeout or **manually** by the user.
 
 ---
 
