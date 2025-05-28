@@ -344,7 +344,7 @@ function processSinglePrintJob(
  */
 function handleChargeResult(array $response, float $amount, string $type): void
 {
-    if ($response['http_code'] !== 201) {
+    if (!in_array($response['http_code'], [200, 201, 204], true)) {
         $errorMsg = sprintf(
             'Failed to create %s charge: HTTP %d, Response: %s',
             $type,
