@@ -65,7 +65,7 @@ You can override the default charge description formats by editing these constan
 
 3. **Define webhook** in Fabman:
 
-   * Event: `resourceLog_created` or `resourceLog_updated`
+   * Event: `Activity log`
    * URL: `https://yourdomain.com/chargeFormlabs.php?secret=your_webhook_token&resources=1322,1516`
 
 > ⚠️ You must explicitly list the Fabman resource IDs of the Formlabs 3D printers (comma-separated list) to handle via the `resources` URL parameter and `secret` must match WEBHOOK_TOKEN in the script.
