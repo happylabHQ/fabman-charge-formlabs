@@ -16,10 +16,13 @@ This PHP script enables **automated billing** for **Formlabs 3D printers** throu
 ## 🔧 Features
 
 * Webhook-based auto-trigger via Fabman
-* Material-based or fallback per-ml pricing
 * Formlabs API integration
-* Works with multiple printers via `?resources=` parameter
+* Works with multiple printers via ?resources= parameter
 * Splits a single Fabman activity into per-printjob activities when multiple prints occur
+* Material-based or fallback per-ml pricing
+* Multiple billing modes (e.g., base price plus material-specific surcharge)
+* Adjusts each Fabman activity’s duration to match the print job exactly
+* Can be combined with Fabman’s time-based billing
 * Structured debug logging
 
 ---
