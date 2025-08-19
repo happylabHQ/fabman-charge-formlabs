@@ -16,6 +16,31 @@
  *     "printer_serial": "Form3XYZ",
  *     "billing_mode": "surcharge"
  *   }
+ *
+ * Typical flow:
+ * This webhook is usually triggered multiple times for a single Fabman activity of a Formlabs 3D printer:
+ *
+ * 1) Activity starts (Fabman Bridge is powered on):
+ *    - No action is taken, as the activity is not yet completed.
+ *
+ * 2) Activity ends (Fabman Bridge is powered off):
+ *    - The webhook queries the Formlabs API for print jobs that were *finished* during the activity's duration.
+ *
+ *    - Case A: No matching print jobs found
+ *        → The activity is deleted.
+ *
+ *    - Case B: Multiple print jobs found
+ *        → The original Fabman activity is split into multiple activities,
+ *          each matching the exact start and end time of a print job (according to the Formlabs API).
+ *
+ *    - Case C: Exactly one print job found, but timestamps differ
+ *        → The Fabman activity's start and/or end time is adjusted to match the print job.
+ *
+ *    - Case D: Exactly one print job found, and timestamps match
+ *        → The activity is billed.
+ *
+ *    - Note: For cases B and C, the webhook is triggered again for each newly created activity.
+ *            These will then fall into Case D and be billed accordingly.
  */
 
 declare(strict_types=1);
@@ -34,8 +59,11 @@ const FABMAN_TOKEN            = 'your_fabman_api_token';
 const FORMLABS_CLIENT_ID      = 'your_formlabs_client_id';
 const FORMLABS_USER           = 'your_user_email@example.com';
 const FORMLABS_PASSWORD       = 'your_formlabs_password';
+const SERVER_TIMEZONE         = 'Europe/Vienna';
+const UTC_TIMEZONE            = 'UTC';
 const DESC_TEMPLATE_BASE      = '3D print %s on %s';
 const DESC_TEMPLATE_SURCHARGE = '3D print %s on %s - surcharge for %.2f ml %s';
+
 /*
 DESC_TEMPLATE_BASE:
    %s → print job name
@@ -47,6 +75,8 @@ DESC_TEMPLATE_SURCHARGE:
    %s → material name
 */
 
+const HTTP_SUCCESS_CODES      = [200, 201, 204];
+
 /**
  * Logs debug messages to output.
  */
@@ -56,17 +86,18 @@ function debugLog(string $message): void
 }
 
 // Determine and log current timezone
-$currentTimezone = ini_get('date.timezone') ?: date_default_timezone_get();
-debugLog("Using timezone: {$currentTimezone}");
+$serverTz = new DateTimeZone(SERVER_TIMEZONE);
+$utcTz = new DateTimeZone(UTC_TIMEZONE);
+debugLog("Using timezone: " . SERVER_TIMEZONE);
 
-// === Validate webhook token ===
+// Validate webhook token
 debugLog('Validating webhook token');
 if (!isset($_GET['secret']) || $_GET['secret'] !== WEBHOOK_TOKEN) {
     http_response_code(403);
     exit('Invalid webhook token.');
 }
 
-// === Read and parse JSON payload ===
+// Read and parse JSON payload
 debugLog('Reading payload');
 $input   = file_get_contents('php://input');
 $payload = json_decode($input);
@@ -75,12 +106,14 @@ if (json_last_error() !== JSON_ERROR_NONE) {
     exit('Invalid JSON payload.');
 }
 
+// Process webhook types resourceLog_created and resourceLog_updated only
 $type = $payload->type ?? null;
 if (!in_array($type, ['resourceLog_created', 'resourceLog_updated'], true)) {
     http_response_code(202);
     exit("Webhook type {$type} not processed.");
 }
 
+// Process webhooks with log payload only
 if (!isset($payload->details->log)) {
     http_response_code(202);
     exit('Missing log data in payload.');
@@ -90,7 +123,7 @@ $logEntry = $payload->details->log;
 $logId    = (int) $logEntry->id;
 debugLog("Processing resource log ID: {$logId}");
 
-// === Determine allowed resources IDs ===
+// Determine and validate allowed resources IDs
 if (isset($_GET['resources'])) {
     $allowedResources = array_map('intval', explode(',', (string) $_GET['resources']));
     debugLog('Allowed resource IDs: ' . implode(',', $allowedResources));
@@ -107,18 +140,20 @@ if (!in_array($resourceId, $allowedResources, true)) {
     exit("Resource ID {$resourceId} is not handled by this webhook.");
 }
 
+// Skip ongoing activities
 if (!isset($logEntry->stopType)) {
     http_response_code(202);
     exit('Event is not a stop; nothing to do.');
 }
 
+// Skip activities which have already been processed
 if (isset($logEntry->metadata->{'Formlabs Printjob'})) {
     debugLog("Metadata already contains 'Formlabs Printjob'; skipping billing.");
     http_response_code(202);
-    exit('Job already processed – skipping.');
+    exit('Job already processed - skipping.');
 }
 
-// === Fetch resource metadata from Fabman ===
+// Fetch resource metadata from Fabman
 $response = callFabmanApi('GET', "resources/{$resourceId}");
 if ($response['http_code'] !== 200) {
     http_response_code(500);
@@ -133,7 +168,7 @@ if (!is_object($resourceMetadata) ||
 }
 debugLog('Loaded resource metadata: ' . json_encode($resourceMetadata));
 
-// === Authenticate with Formlabs ===
+// Authenticate with Formlabs API
 $accessToken = formLabsLogin(FORMLABS_CLIENT_ID, FORMLABS_USER, FORMLABS_PASSWORD);
 debugLog('Obtained Formlabs access token: ' . ($accessToken !== null ? 'yes' : 'no'));
 if ($accessToken === null) {
@@ -141,11 +176,11 @@ if ($accessToken === null) {
     exit('Server error: Formlabs authentication failed.');
 }
 
-// === Determine activity timeframe ===
+// Determine Fabman activity timeframe
 $activityStart = new DateTimeImmutable($logEntry->createdAt);
 $activityEnd   = new DateTimeImmutable($logEntry->stoppedAt);
 
-// === Retrieve printjobs from Formlabs ===
+// Retrieve printjobs from Formlabs which have been finished during the activity period
 $prints = formLabsGetPrints(
     $accessToken,
     $resourceMetadata->printer_serial,
@@ -162,10 +197,32 @@ $memberId     = (int) $logEntry->member;
 $printCount   = count($prints);
 $resourceName = $payload->details->resource->name ?? 'unknown device';
 
-// no print jobs during this activity period
+// No print jobs during this activity period
 if ($printCount === 0) {
-    http_response_code(202);
-    exit('No Formlabs prints during this activity.');
+    debugLog('No Formlabs prints during this activity');
+    /*
+    * Delete the Fabman activity that triggered the webhook.
+    * Reason: If the activity was taken over by another Fabman member during the print job,
+    * the subsequent activity (which is relevant for billing) cannot be adjusted to match
+    * the duration of the print job, as it would overlap with this activity.
+    */
+    $del = callFabmanApi('DELETE', "resource-logs/{$logId}");
+    if (in_array($del['http_code'], HTTP_SUCCESS_CODES, true)) {
+        http_response_code(202);
+        exit("Activity $logId deleted");
+    } else {
+        if ($del['http_code'] == 404) {
+            exit("Activity $logId doesn't exist anymore - no need to delete it");
+        } else {
+            http_response_code(500);
+            exit(sprintf(
+                "Failed to delete Activity %d: HTTP %d, Response: %s",
+                $logId,
+                $del['http_code'],
+                json_encode($del['data'])
+            ));
+        }
+    }
 
 // a single print job during this activity period
 } elseif ($printCount === 1) {
@@ -187,14 +244,21 @@ if ($printCount === 0) {
     // activity is longer than the print job, so adjust the activity duration
     } else {
         debugLog('Timeranges differ, shrinking activity');
-        $pjStart = new DateTimeImmutable($printJob->print_started_at);
-        $pjEnd   = !empty($printJob->print_finished_at)
-            ? new DateTimeImmutable($printJob->print_finished_at)
-            : new DateTimeImmutable();
-        $createdAtUtc = $pjStart->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
-        $stoppedAtUtc = $pjEnd  ->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
+
+        try {
+            $pjStart = new DateTimeImmutable($printJob->print_started_at);
+            $pjEnd   = getPrintJobEndDate($printJob);
+        } catch (Exception $e) {
+            debugLog("No valid end date for PrintJob {$printJob->guid}, using current time as fallback");
+            $pjEnd = new DateTimeImmutable(); // fallback to now
+        }
+
+        $createdAtUtc = $pjStart->setTimezone($utcTz)->format('Y-m-d\TH:i:s\Z');
+        $stoppedAtUtc = $pjEnd->setTimezone($utcTz)->format('Y-m-d\TH:i:s\Z');
+
         $timeRes = updateActivityTimestamps($logId, $createdAtUtc, $stoppedAtUtc);
-        if (!in_array($timeRes['http_code'], [200,201,204], true)) {
+
+        if (!in_array($timeRes['http_code'], HTTP_SUCCESS_CODES, true)) {
             http_response_code(500);
             exit(sprintf(
                 "Failed to update metadata: HTTP %d, Response: %s",
@@ -224,13 +288,23 @@ if ($printCount === 0) {
     // create a new activity for each print job
     foreach (array_reverse($prints) as $printJob) {
         $pjStart = new DateTimeImmutable($printJob->print_started_at);
-        $pjEnd   = !empty($printJob->print_finished_at)
-            ? new DateTimeImmutable($printJob->print_finished_at)
-            : new DateTimeImmutable();
 
-        $createdAtUtc = $pjStart->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
-        $stoppedAtUtc = $pjEnd  ->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
+        try {
+            $pjEnd = getPrintJobEndDate($printJob);
+        } catch (Exception $e) {
+            debugLog("No valid end date for PrintJob {$printJob->guid}, using current time as fallback");
+            $pjEnd = new DateTimeImmutable(); // fallback to now
+        }
 
+        // Lokale Zeitstempel (serverTz)
+        $createdAtLocal = $pjStart->setTimezone($serverTz)->format('Y-m-d H:i:s');
+        $stoppedAtLocal = $pjEnd->setTimezone($serverTz)->format('Y-m-d H:i:s');
+
+        debugLog("Trying to create activity for PrintJob {$printJob->id} with start: {$createdAtLocal} and end: {$stoppedAtLocal} (local time)");
+
+        $createdAtUtc = $pjStart->setTimezone($utcTz)->format('Y-m-d\TH:i:s\Z');
+        $stoppedAtUtc = $pjEnd->setTimezone($utcTz)->format('Y-m-d\TH:i:s\Z');
+                    
         $newLogPayload = [
             'resource'  => $resourceId,
             'member'    => $memberId,
@@ -240,11 +314,11 @@ if ($printCount === 0) {
 
         $createLog = callFabmanApi('POST', 'resource-logs', $newLogPayload);
         if ($createLog['http_code'] !== 201) {
-            debugLog("Failed to create new activity for job {$printJob->id}");
+            $errorMessage = isset($createLog['data']->message) ? $createLog['data']->message : 'Unknown error';
+            debugLog("Failed to create new activity for job {$printJob->id}. Error: {$errorMessage}");
             continue;
         }
     }
-
     exit("Split Fabman activity into {$printCount} separate activities according to Formlabs prints.");
 }
 
@@ -263,15 +337,21 @@ function processSinglePrintJob(
     object                $resourceMetadata,
     string                $resourceName
 ): void {
-    global $currentTimezone;
+    #global $currentTimezone;
+    global $serverTz;
 
     // Parse timestamps
-    $printStartedAt  = isset($printJob->print_started_at)
+    $printStartedAt = isset($printJob->print_started_at)
         ? new DateTimeImmutable($printJob->print_started_at)
         : null;
-    $printFinishedAt = isset($printJob->print_finished_at)
-        ? new DateTimeImmutable($printJob->print_finished_at)
-        : null;
+
+    try {
+        $printFinishedAt = getPrintJobEndDate($printJob);
+    } catch (Exception $e) {
+        debugLog('Print job missing end timestamp and no fallback available; skipping.');
+        http_response_code(202);
+        exit('Missing Formlabs print end timestamp.');
+    }
 
     // Validate timestamps
     if (!$printStartedAt || !$printFinishedAt) {
@@ -281,14 +361,21 @@ function processSinglePrintJob(
     }
 
     if (
-        $activityStart > $printStartedAt ||
-        $printStartedAt > $printFinishedAt ||
-        $printFinishedAt > $activityEnd
+        $activityStart->getTimestamp() > $printStartedAt->getTimestamp() ||
+        $printStartedAt->getTimestamp() > $printFinishedAt->getTimestamp() ||
+        $printFinishedAt->getTimestamp() > $activityEnd->getTimestamp()
     ) {
-        debugLog('Invalid timestamp order; skipping print job.');
+        debugLog(sprintf(
+            "Invalid timestamp order: activityStart=%s, printStartedAt=%s, printFinishedAt=%s, activityEnd=%s",
+            $activityStart->format('Y-m-d H:i:s'),
+            $printStartedAt->format('Y-m-d H:i:s'),
+            $printFinishedAt->format('Y-m-d H:i:s'),
+            $activityEnd->format('Y-m-d H:i:s')
+        ));
         http_response_code(202);
         exit('Timestamp order invalid; skipping print job.');
     }
+
 
     // Extract pricing data
     $printName           = $printJob->name                          ?? 'n/a';
@@ -308,10 +395,10 @@ function processSinglePrintJob(
 
     // Determine charge timestamp (end of print)
     $chargeDateTime = $printFinishedAt
-        ->setTimezone(new DateTimeZone($currentTimezone))
+        ->setTimezone($serverTz)
         ->format('Y-m-d\TH:i');
     debugLog("Charge dateTime: {$chargeDateTime}");
-
+    
     // Billing logic: surcharge vs default
     if ($billingMode === 'surcharge') {
         // Base charge
@@ -343,13 +430,7 @@ function processSinglePrintJob(
         $res        = createFabmanCharge($memberId, $chargeDateTime, $desc, $totalPrice, $logId);
         handleChargeResult($res, $totalPrice, 'single');
     }
-
-
-    #$pause = 5;
-    #debugLog("Waiting for $pause seconds");
-    #sleep($pause);
-
-
+    
     // Update activity metadata
     $jobMeta = [
         'Formlabs Printjob' => array_merge(
@@ -369,7 +450,7 @@ function processSinglePrintJob(
 
     debugLog('Updating activity metadata (Formlabs Printjob): ' . json_encode($jobMeta['Formlabs Printjob']));
     $metaRes = updateActivityMetadata($logId, $jobMeta, true);
-    if (!in_array($metaRes['http_code'], [200,201,204], true)) {
+    if (!in_array($metaRes['http_code'], HTTP_SUCCESS_CODES, true)) {
         http_response_code(500);
         exit(sprintf(
             "Failed to update metadata: HTTP %d, Response: %s",
@@ -377,35 +458,6 @@ function processSinglePrintJob(
             json_encode($metaRes['data'])
         ));
     }
-
-    /*
-    // Shrink activity duration
-    $createdAtUtc = $printStartedAt
-        ->setTimezone(new DateTimeZone('UTC'))
-        ->format('Y-m-d\TH:i:s\Z');
-    $stoppedAtUtc = $printFinishedAt
-        ->setTimezone(new DateTimeZone('UTC'))
-        ->format('Y-m-d\TH:i:s\Z');
-
-    debugLog("Shrinking activity duration: $createdAtUtc - $stoppedAtUtc");
-    $timeRes = updateActivityTimestamps($logId, $createdAtUtc, $stoppedAtUtc);
-    if (!in_array($timeRes['http_code'], [200,201,204], true)) {
-        http_response_code(500);
-        exit(sprintf(
-            "Failed to update metadata: HTTP %d, Response: %s",
-            $timeRes['http_code'],
-            json_encode($timeRes['data'])
-        ));
-    }
-    */
-
-    /*
-    debugLog("Updating activity {$logId}: shrink to print duration and add metadata");
-    $updRes = updateActivity($logId, $createdAtUtc, $stoppedAtUtc, $jobMeta, true);
-    if (!in_array($updRes['http_code'], [200, 201, 204], true)) {
-        debugLog("Failed to update metadata: HTTP {$updRes['http_code']}");
-    }
-    */
 
     // Output result summary
     echo ($billingMode === 'surcharge')
@@ -418,7 +470,7 @@ function processSinglePrintJob(
  */
 function handleChargeResult(array $response, float $amount, string $type): void
 {
-    if (!in_array($response['http_code'], [200, 201, 204], true)) {
+    if (!in_array($response['http_code'], HTTP_SUCCESS_CODES, true)) {
         $errorMsg = sprintf(
             'Failed to create %s charge: HTTP %d, Response: %s',
             $type,
@@ -473,6 +525,8 @@ function formLabsLogin(string $clientId, string $username, string $password): ?s
  */
 function formLabsGetPrints(string $accessToken, string $printerSerial, DateTimeInterface $from, DateTimeInterface $to): ?array
 {
+    global $serverTz;
+
     $perPage = 100;
     $page    = 1;
     $all     = [];
@@ -515,18 +569,27 @@ function formLabsGetPrints(string $accessToken, string $printerSerial, DateTimeI
         }
 
         foreach ($data->results as $pj) {
-            if (empty($pj->print_started_at) || empty($pj->print_finished_at)) {
+            if (empty($pj->print_started_at)) {
+                debugLog("Skip incomplete print job {$pj->name}");
                 continue;
             }
+
             try {
-                $start = new DateTimeImmutable($pj->print_started_at);
-                $end   = new DateTimeImmutable($pj->print_finished_at);
+                $end = getPrintJobEndDate($pj);
             } catch (Exception $e) {
                 debugLog("Invalid date in job {$pj->guid}: {$e->getMessage()}");
                 continue;
             }
-            if ($start >= $from && $end <= $to) {
+
+            if ($end >= $from && $end <= $to) {
                 $all[] = $pj;
+            } else {     
+                debugLog(sprintf(
+                    "Print job end timestamp %s not within activity (%s and %s)",
+                    $end->setTimezone($serverTz)->format(DateTime::ATOM),
+                    $from->setTimezone($serverTz)->format(DateTime::ATOM),
+                    $to->setTimezone($serverTz)->format(DateTime::ATOM)
+                ));               
             }
         }
 
@@ -535,6 +598,32 @@ function formLabsGetPrints(string $accessToken, string $printerSerial, DateTimeI
     } while ($fetched === $perPage);
 
     return $all;
+}
+
+/**
+ * Returns the end date of a print job.
+ * - Uses print_finished_at if available.
+ * - Otherwise uses print_run_success->created_at if print_run_success is SUCCESS.
+ * - Throws an exception if no valid end date is found.
+ *
+ * @throws Exception
+ */
+function getPrintJobEndDate(object $printJob): DateTimeImmutable
+{
+    if (!empty($printJob->print_finished_at)) {
+        return new DateTimeImmutable($printJob->print_finished_at);
+    }
+
+    if (
+        isset($printJob->print_run_success) &&
+        isset($printJob->print_run_success->print_run_success) &&
+        $printJob->print_run_success->print_run_success === "SUCCESS" &&
+        !empty($printJob->print_run_success->created_at)
+    ) {
+        return new DateTimeImmutable($printJob->print_run_success->created_at);
+    }
+
+    throw new Exception("No valid end date for PrintJob {$printJob->guid}");
 }
 
 /**
@@ -611,14 +700,16 @@ function createFabmanCharge(int $memberId, string $dateTime, string $description
 }
 
 /**
- * Shrinkt eine Activity auf neue Start-/Stopp-Zeiten, mit Retry bei Lock-Conflicts.
+ * Shrinks an activity to new start/stop timestamps, with retries on lock conflicts.
  */
 function updateActivityTimestamps(int $resourceLogId, string $createdAt, string $stoppedAt): array
 {
     $maxAttempts = 5;
     $attempt     = 0;
+
     do {
         $attempt++;
+
         // 1) Load current lockVersion
         $get = callFabmanApi('GET', "resource-logs/{$resourceLogId}");
         if ($get['http_code'] !== 200) {
@@ -626,29 +717,38 @@ function updateActivityTimestamps(int $resourceLogId, string $createdAt, string 
         }
         $lockVersion = $get['data']->lockVersion ?? null;
 
-        // 2) Versuch, nur die Zeiten zu setzen
+        // 2) Attempt to update timestamps only
         $payload = [
             'createdAt'   => $createdAt,
             'stoppedAt'   => $stoppedAt,
             'lockVersion' => $lockVersion,
         ];
+
         $put = callFabmanApi('PUT', "resource-logs/{$resourceLogId}", $payload);
 
-        if (in_array($put['http_code'], [200, 201, 204], true)) {
+        if (in_array($put['http_code'], HTTP_SUCCESS_CODES, true)) {
+            debugLog(sprintf(
+                "Updated activity #%d timestamps: createdAt=%s, stoppedAt=%s",
+                $resourceLogId,
+                $createdAt,
+                $stoppedAt
+            ));
             return $put;
         }
 
-        // ggf. warten und retryen
-        debugLog("Timestamp-Update Versuch #{$attempt} fehlgeschlagen (HTTP {$put['http_code']}); retrying");
+        // If necessary, wait and retry
+        debugLog("Timestamp update attempt #{$attempt} failed (HTTP {$put['http_code']}); retrying");
         usleep(200000);
+
     } while ($attempt < $maxAttempts);
 
     return $put;
 }
 
 
+
 /**
- * Aktualisiert nur die Metadaten einer Activity, mit Retry bei Lock-Conflicts.
+ * Updates only the metadata of an activity, with retries on lock conflicts.
  */
 function updateActivityMetadata(int $resourceLogId, array $newMetadata, bool $merge = true): array
 {
@@ -656,7 +756,7 @@ function updateActivityMetadata(int $resourceLogId, array $newMetadata, bool $me
     $attempt     = 0;
     do {
         $attempt++;
-        // 1) Aktuelles Log mit Metadata und LockVersion holen
+        // 1) Retrieve current log with metadata and lockVersion
         $get = callFabmanApi('GET', "resource-logs/{$resourceLogId}");
         if ($get['http_code'] !== 200) {
             return $get;
@@ -667,63 +767,23 @@ function updateActivityMetadata(int $resourceLogId, array $newMetadata, bool $me
             ? array_merge($existingMetadata, $newMetadata)
             : $newMetadata;
 
-        // 2) Versuch, nur die Metadata zu setzen
+        // 2) Attempt to update metadata only
         $payload = [
             'metadata'    => $payloadMeta,
             'lockVersion' => $lockVersion,
         ];
         $put = callFabmanApi('PUT', "resource-logs/{$resourceLogId}", $payload);
 
-        if (in_array($put['http_code'], [200, 201, 204], true)) {
+        if (in_array($put['http_code'], HTTP_SUCCESS_CODES, true)) {
             return $put;
         }
 
-        debugLog("Metadata-Update Versuch #{$attempt} fehlgeschlagen (HTTP {$put['http_code']}); retrying");
+        debugLog("Metadata update attempt #{$attempt} failed (HTTP {$put['http_code']}); retrying");
         usleep(200000);
     } while ($attempt < $maxAttempts);
 
     return $put;
 }
-
-/**
- * Updates a resource-log activity with new timestamps and metadata.
- */
-/*
-function updateActivity(int $resourceLogId, string $createdAt, string $stoppedAt, array $newMetadata, bool $merge = true): array
-{
-    $maxAttempts = 5;
-    $attempt     = 0;
-
-    do {
-        $attempt++;
-        $getRes = callFabmanApi('GET', "resource-logs/{$resourceLogId}");
-        if ($getRes['http_code'] !== 200) {
-            debugLog("Attempt #{$attempt}: failed to load resource log (HTTP {$getRes['http_code']})");
-            return $getRes;
-        }
-
-        $lockVersion       = $getRes['data']->lockVersion ?? null;
-        $existingMetadata  = (array)($getRes['data']->metadata ?? []);
-        $mergedMetadata    = $merge ? array_merge($existingMetadata, $newMetadata) : $newMetadata;
-
-        $payload = [
-            'createdAt'   => $createdAt,
-            'stoppedAt'   => $stoppedAt,
-            'metadata'    => $mergedMetadata,
-            'lockVersion' => $lockVersion,
-        ];
-
-        $putRes = callFabmanApi('PUT', "resource-logs/{$resourceLogId}", $payload);
-        if (in_array($putRes['http_code'], [200, 201, 204], true)) {
-            return $putRes;
-        }
-        debugLog("Attempt #{$attempt}: failed to update metadata (HTTP {$putRes['http_code']}); retrying...");
-        usleep(200000);
-    } while ($attempt < $maxAttempts);
-
-    return $putRes;
-}
-*/
 
 /**
  * Sanitizes a Formlabs print job for metadata storage.
@@ -748,17 +808,21 @@ function sanitizePrintJob(object $job): array
 }
 
 /**
- * Prüft, ob die Timeranges aus Webhook-Payload und Formlabs-Job exakt zusammenpassen.
+ * Checks whether the time ranges from the webhook payload and the Formlabs job match exactly.
  *
- * @param object $logEntry  Das Objekt aus dem Webhook, mit ->createdAt und ->stoppedAt (ISO-Strings)
- * @param object $printJob  Das Formlabs-Job-Objekt, mit ->print_started_at und ->print_finished_at
- * @return bool             True, wenn Start- und End-Zeit sekundengenau übereinstimmen
+ * @param object $logEntry  The object from the webhook, with ->createdAt and ->stoppedAt (ISO strings)
+ * @param object $printJob  The Formlabs job object, with ->print_started_at and ->print_finished_at
+ * @return bool             True if start and end times match exactly to the second
  */
 function timerangesMatch(object $logEntry, object $printJob): bool
 {
-    // existenz prüfen
-    if (empty($logEntry->createdAt) || empty($logEntry->stoppedAt)
-     || empty($printJob->print_started_at) || empty($printJob->print_finished_at)) {
+    global $serverTz, $utcTz;
+
+    if (
+        empty($logEntry->createdAt) ||
+        empty($logEntry->stoppedAt) ||
+        empty($printJob->print_started_at)
+    ) {
         return false;
     }
 
@@ -766,15 +830,27 @@ function timerangesMatch(object $logEntry, object $printJob): bool
         $logStart   = new DateTimeImmutable($logEntry->createdAt);
         $logEnd     = new DateTimeImmutable($logEntry->stoppedAt);
         $printStart = new DateTimeImmutable($printJob->print_started_at);
-        $printEnd   = new DateTimeImmutable($printJob->print_finished_at);
+        $printEnd   = getPrintJobEndDate($printJob);
+
+        debugLog(sprintf(
+            "Comparing timeranges (server timezone): logStart=%s, logEnd=%s | printStart=%s, printEnd=%s",
+            $logStart->setTimezone($serverTz)->format(DateTime::ATOM),
+            $logEnd->setTimezone($serverTz)->format(DateTime::ATOM),
+            $printStart->setTimezone($serverTz)->format(DateTime::ATOM),
+            $printEnd->setTimezone($serverTz)->format(DateTime::ATOM)
+        ));
+
+        // Normalize to UTC for accurate comparison
+        $logStartUtc   = $logStart->setTimezone($utcTz);
+        $logEndUtc     = $logEnd->setTimezone($utcTz);
+        $printStartUtc = $printStart->setTimezone($utcTz);
+        $printEndUtc   = $printEnd->setTimezone($utcTz);
+
+        return $logStartUtc->getTimestamp() === $printStartUtc->getTimestamp()
+            && $logEndUtc->getTimestamp() === $printEndUtc->getTimestamp();
+
     } catch (Exception $e) {
-        // ungültiges Datum
         return false;
     }
-
-    // in UTC normalize und als Integer vergleichen
-    return $logStart->setTimezone(new DateTimeZone('UTC'))->getTimestamp() ===
-           $printStart->setTimezone(new DateTimeZone('UTC'))->getTimestamp()
-       && $logEnd  ->setTimezone(new DateTimeZone('UTC'))->getTimestamp() ===
-           $printEnd  ->setTimezone(new DateTimeZone('UTC'))->getTimestamp();
 }
+
